@@ -31,9 +31,9 @@ TELEGRAM_RE = re.compile(r'(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)'
 # WhatsApp: capture number or chat code and allow full URL reconstruction
 WHATSAPP_URL_RE = re.compile(
     r'(?:https?://)?(?:'
-    r'(?:api\.whatsapp\.com/send\?phone=(?P<num_api>\d+))|'
-    r'(?:wa\.me/(?P<num_wa>\d+))|'
-    r'(?:chat\.whatsapp\.com/(?P<chat>[A-Za-z0-9_-]+))'
+    r'(?:api\.whatsapp\.com/send\?(?:[^\s"\'>]*&)?phone=(?P<num_api>\+?\d+)[^\s"\'>]*)|'
+    r'(?:wa\.me/(?P<num_wa>\+?\d+)(?:[^\s"\'>]*)?)|'
+    r'(?:chat\.whatsapp\.com/(?P<chat>[A-Za-z0-9_-]+)(?:[^\s"\'>]*)?)'
     r')',
     re.I
 )
@@ -150,17 +150,20 @@ def parse_contacts(html_text: str):
             found["phones"].append(cleaned)
     # telegram
     for tg in TELEGRAM_RE.findall(html_text):
-        found["telegrams"].append(tg.strip())
+        username = tg.strip().lstrip('@')
+        if username:
+            found["telegrams"].append(f"https://t.me/{username}")
     # whatsapp: normalize links and extract phone numbers
     for m in WHATSAPP_URL_RE.finditer(html_text):
         num = m.group('num_api') or m.group('num_wa')
         chat = m.group('chat')
         if num:
-            link = f"https://wa.me/{num}"
+            digits_only = re.sub(r'\D', '', num)
+            link = f"https://wa.me/{digits_only}"
             found["whatsapps"].append(link)
             # also add phone number
-            if num:
-                found["phones"].append("+" + num if not num.startswith('+') else num)
+            if digits_only:
+                found["phones"].append("+" + digits_only)
         elif chat:
             link = f"https://chat.whatsapp.com/{chat}"
             found["whatsapps"].append(link)
