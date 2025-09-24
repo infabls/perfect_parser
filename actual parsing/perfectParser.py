@@ -26,6 +26,14 @@ TELEGRAM_RE = re.compile(r'(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)'
 WHATSAPP_RE = re.compile(r'(?:https?://)?(?:(?:api\.whatsapp\.com/send\?phone=)|(?:wa\.me/)|(?:chat\.whatsapp\.com/))([A-Za-z0-9_\-?=&]+)', re.I)
 MAILTO_RE = re.compile(r'href=["\']mailto:([^"\'>\s]+)', re.I)
 TEL_LINK_RE = re.compile(r'href=["\']tel:([^"\']+)', re.I)
+FACEBOOK_RE = re.compile(r'(?:https?://)?(?:www\.)?(facebook\.com|fb\.com)/[A-Za-z0-9_.-]+', re.I)
+INSTAGRAM_RE = re.compile(r'(?:https?://)?(?:www\.)?instagram\.com/[A-Za-z0-9_.-]+', re.I)
+YOUTUBE_RE = re.compile(r'(?:https?://)?(?:www\.)?(youtube\.com|youtu\.be)/[\w@\-/?=&#.]+', re.I)
+X_RE = re.compile(r'(?:https?://)?(?:www\.)?x\.com/[A-Za-z0-9_.-]+', re.I)
+REDDIT_RE = re.compile(r'(?:https?://)?(?:www\.)?reddit\.com/[A-Za-z0-9_\-/?=&#.]+', re.I)
+TIKTOK_RE = re.compile(r'(?:https?://)?(?:www\.)?tiktok\.com/@[A-Za-z0-9_.-]+', re.I)
+VK_RE = re.compile(r'(?:https?://)?(?:www\.)?vk\.com/[A-Za-z0-9_.-]+', re.I)
+TRUSTPILOT_RE = re.compile(r'(?:https?://)?(?:www\.)?trustpilot\.com/(?:review|evaluate|view)/[A-Za-z0-9_.\-/]+', re.I)
 
 # Async DNS resolver (dnspython)
 resolver = Resolver(configure=True)
@@ -99,7 +107,8 @@ async def get_registration_date(domain):
 
 # Parse page content for contacts
 def parse_contacts(html_text: str):
-    found = {"emails": [], "phones": [], "telegrams": [], "whatsapps": []}
+    found = {"emails": [], "phones": [], "telegrams": [], "whatsapps": [],
+             "facebook": [], "instagram": [], "youtube": [], "x": [], "reddit": [], "tiktok": [], "vk": [], "trustpilot": []}
     if not html_text:
         return found
     # mailto links
@@ -123,6 +132,30 @@ def parse_contacts(html_text: str):
     # whatsapp
     for wa in WHATSAPP_RE.findall(html_text):
         found["whatsapps"].append(wa.strip())
+    # facebook
+    for fb in FACEBOOK_RE.findall(html_text):
+        found["facebook"].append(fb if isinstance(fb, str) else fb[0])
+    # instagram
+    for ig in INSTAGRAM_RE.findall(html_text):
+        found["instagram"].append(ig if isinstance(ig, str) else ig[0])
+    # youtube
+    for yt in YOUTUBE_RE.findall(html_text):
+        found["youtube"].append(yt if isinstance(yt, str) else yt[0])
+    # x.com
+    for x in X_RE.findall(html_text):
+        found["x"].append(x if isinstance(x, str) else x[0])
+    # reddit
+    for rd in REDDIT_RE.findall(html_text):
+        found["reddit"].append(rd if isinstance(rd, str) else rd[0])
+    # tiktok
+    for tk in TIKTOK_RE.findall(html_text):
+        found["tiktok"].append(tk if isinstance(tk, str) else tk[0])
+    # vk
+    for vk in VK_RE.findall(html_text):
+        found["vk"].append(vk if isinstance(vk, str) else vk[0])
+    # trustpilot
+    for tp in TRUSTPILOT_RE.findall(html_text):
+        found["trustpilot"].append(tp if isinstance(tp, str) else tp[0])
     # unique
     for k in found:
         found[k] = list(dict.fromkeys([x for x in found[k] if x]))
@@ -141,6 +174,14 @@ async def process_domain(domain, session, sem):
             "phones": [],
             "telegrams": [],
             "whatsapps": [],
+            "facebook": [],
+            "instagram": [],
+            "youtube": [],
+            "x": [],
+            "reddit": [],
+            "tiktok": [],
+            "vk": [],
+            "trustpilot": [],
             "error": None
         }
         try:
@@ -159,6 +200,14 @@ async def process_domain(domain, session, sem):
                 result["phones"] = parsed["phones"]
                 result["telegrams"] = parsed["telegrams"]
                 result["whatsapps"] = parsed["whatsapps"]
+                result["facebook"] = parsed["facebook"]
+                result["instagram"] = parsed["instagram"]
+                result["youtube"] = parsed["youtube"]
+                result["x"] = parsed["x"]
+                result["reddit"] = parsed["reddit"]
+                result["tiktok"] = parsed["tiktok"]
+                result["vk"] = parsed["vk"]
+                result["trustpilot"] = parsed["trustpilot"]
 
             # registration date via WHOIS/RDAP (blocking call inside executor)
             # reg = await get_registration_date(domain)
@@ -180,7 +229,7 @@ async def main():
         results = await tqdm_asyncio.gather(*tasks)
 
     # Save CSV and JSON
-    keys = ["domain","site_status","site_url","registration_date","emails","phones","telegrams","whatsapps","error"]
+    keys = ["domain","site_status","site_url","registration_date","emails","phones","telegrams","whatsapps","facebook","instagram","youtube","x","reddit","tiktok","vk","trustpilot","error"]
     # CSV
     async with aiofiles.open(OUTPUT_CSV, "w", encoding="utf-8", newline='') as f:
         await f.write(",".join(keys) + "\n")
