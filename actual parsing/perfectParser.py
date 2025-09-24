@@ -135,7 +135,7 @@ async def process_domain(domain, session, sem):
             "domain": domain,
             "site_status": "unknown",
             "site_url": "",
-            "txt_records": [],
+            # "txt_records": [],  # DNS временно отключено
             "registration_date": None,
             "emails": [],
             "phones": [],
@@ -145,8 +145,8 @@ async def process_domain(domain, session, sem):
         }
         try:
             # DNS TXT
-            txts = await get_txt(domain)
-            result["txt_records"] = txts
+            # txts = await get_txt(domain)
+            # result["txt_records"] = txts
 
             # HTTP site check and parse
             site = await check_site(session, domain)
@@ -161,8 +161,8 @@ async def process_domain(domain, session, sem):
                 result["whatsapps"] = parsed["whatsapps"]
 
             # registration date via WHOIS/RDAP (blocking call inside executor)
-            reg = await get_registration_date(domain)
-            result["registration_date"] = reg
+            # reg = await get_registration_date(domain)
+            # result["registration_date"] = reg
 
         except Exception as e:
             result["error"] = str(e)
@@ -177,15 +177,12 @@ async def main():
     async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers={"User-Agent":"Mozilla/5.0 (compatible; domain-scanner/1.0)"}) as session:
         tasks = [process_domain(d, session, sem) for d in domains]
         # use tqdm_asyncio for progress
-        results = []
-        for r in await tqdm_asyncio.gather(*tasks, return_exceptions=False):
-            results.append(r)
+        results = await tqdm_asyncio.gather(*tasks)
 
     # Save CSV and JSON
-    keys = ["domain","site_status","site_url","txt_records","registration_date","emails","phones","telegrams","whatsapps","error"]
+    keys = ["domain","site_status","site_url","registration_date","emails","phones","telegrams","whatsapps","error"]
     # CSV
     async with aiofiles.open(OUTPUT_CSV, "w", encoding="utf-8", newline='') as f:
-        writer = csv.writer(await f.__aenter__())
         await f.write(",".join(keys) + "\n")
         for row in results:
             # flatten lists as JSON strings
