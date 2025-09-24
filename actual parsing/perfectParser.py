@@ -13,27 +13,45 @@ from typing import Optional
 from tqdm.asyncio import tqdm_asyncio
 
 # CONFIG
-CONCURRENCY = 50
+CONCURRENCY = 30
 REQUEST_TIMEOUT = 15
 RETRIES = 2
 OUTPUT_CSV = "domains_result.csv"
 DOMAINS_FILE = "domains.txt"
 
+# Exclude known non-user emails
+EMAIL_BLACKLIST = {
+    "61b30ccdbd7bc003a750ee837c497280@sentry.io",
+}
+
 # Regex patterns
 EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', re.I)
 PHONE_RE = re.compile(r'(?:(?:\+?\d{1,3})?[\s\-.(]*)?(?:\d{2,4}[\s\-).]*){2,5}\d{2,4}')
 TELEGRAM_RE = re.compile(r'(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]+)', re.I)
-WHATSAPP_RE = re.compile(r'(?:https?://)?(?:(?:api\.whatsapp\.com/send\?phone=)|(?:wa\.me/)|(?:chat\.whatsapp\.com/))([A-Za-z0-9_\-?=&]+)', re.I)
+# WhatsApp: capture number or chat code and allow full URL reconstruction
+WHATSAPP_URL_RE = re.compile(
+    r'(?:https?://)?(?:'
+    r'(?:api\.whatsapp\.com/send\?phone=(?P<num_api>\d+))|'
+    r'(?:wa\.me/(?P<num_wa>\d+))|'
+    r'(?:chat\.whatsapp\.com/(?P<chat>[A-Za-z0-9_-]+))'
+    r')',
+    re.I
+)
 MAILTO_RE = re.compile(r'href=["\']mailto:([^"\'>\s]+)', re.I)
 TEL_LINK_RE = re.compile(r'href=["\']tel:([^"\']+)', re.I)
-FACEBOOK_RE = re.compile(r'(?:https?://)?(?:www\.)?(facebook\.com|fb\.com)/[A-Za-z0-9_.-]+', re.I)
+FACEBOOK_RE = re.compile(r'(?:https?://)?(?:www\.)?(?:facebook\.com|fb\.com)/[A-Za-z0-9_.\-/?=&#]+', re.I)
 INSTAGRAM_RE = re.compile(r'(?:https?://)?(?:www\.)?instagram\.com/[A-Za-z0-9_.-]+', re.I)
-YOUTUBE_RE = re.compile(r'(?:https?://)?(?:www\.)?(youtube\.com|youtu\.be)/[\w@\-/?=&#.]+', re.I)
+YOUTUBE_RE = re.compile(r'(?:https?://)?(?:www\.)?(?:youtube\.com|youtu\.be)/[\w@\-/?=&#.]+', re.I)
 X_RE = re.compile(r'(?:https?://)?(?:www\.)?x\.com/[A-Za-z0-9_.-]+', re.I)
 REDDIT_RE = re.compile(r'(?:https?://)?(?:www\.)?reddit\.com/[A-Za-z0-9_\-/?=&#.]+', re.I)
 TIKTOK_RE = re.compile(r'(?:https?://)?(?:www\.)?tiktok\.com/@[A-Za-z0-9_.-]+', re.I)
 VK_RE = re.compile(r'(?:https?://)?(?:www\.)?vk\.com/[A-Za-z0-9_.-]+', re.I)
 TRUSTPILOT_RE = re.compile(r'(?:https?://)?(?:www\.)?trustpilot\.com/(?:review|evaluate|view)/[A-Za-z0-9_.\-/]+', re.I)
+
+# Language extraction helpers
+HTML_LANG_RE = re.compile(r'<html[^>]*\blang=["\']([a-zA-Z]{2,3})(?:-[a-zA-Z0-9-]+)?["\']', re.I)
+TITLE_RE = re.compile(r'<title[^>]*>(.*?)</title>', re.I | re.S)
+META_DESC_RE = re.compile(r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']', re.I | re.S)
 
 # Async DNS resolver (dnspython)
 resolver = Resolver(configure=True)
@@ -113,10 +131,14 @@ def parse_contacts(html_text: str):
         return found
     # mailto links
     for m in MAILTO_RE.findall(html_text):
-        found["emails"].append(m.strip())
+        email_value = m.strip()
+        if email_value.lower() not in EMAIL_BLACKLIST:
+            found["emails"].append(email_value)
     # emails in text
     for m in EMAIL_RE.findall(html_text):
-        found["emails"].append(m.strip())
+        email_value = m.strip()
+        if email_value.lower() not in EMAIL_BLACKLIST:
+            found["emails"].append(email_value)
     # tel links
     for t in TEL_LINK_RE.findall(html_text):
         found["phones"].append(t.strip())
@@ -129,9 +151,19 @@ def parse_contacts(html_text: str):
     # telegram
     for tg in TELEGRAM_RE.findall(html_text):
         found["telegrams"].append(tg.strip())
-    # whatsapp
-    for wa in WHATSAPP_RE.findall(html_text):
-        found["whatsapps"].append(wa.strip())
+    # whatsapp: normalize links and extract phone numbers
+    for m in WHATSAPP_URL_RE.finditer(html_text):
+        num = m.group('num_api') or m.group('num_wa')
+        chat = m.group('chat')
+        if num:
+            link = f"https://wa.me/{num}"
+            found["whatsapps"].append(link)
+            # also add phone number
+            if num:
+                found["phones"].append("+" + num if not num.startswith('+') else num)
+        elif chat:
+            link = f"https://chat.whatsapp.com/{chat}"
+            found["whatsapps"].append(link)
     # facebook
     for fb in FACEBOOK_RE.findall(html_text):
         found["facebook"].append(fb if isinstance(fb, str) else fb[0])
@@ -159,7 +191,61 @@ def parse_contacts(html_text: str):
     # unique
     for k in found:
         found[k] = list(dict.fromkeys([x for x in found[k] if x]))
+    # final email blacklist filter
+    found["emails"] = [e for e in found["emails"] if e.lower() not in EMAIL_BLACKLIST]
     return found
+
+def detect_language(html_text: str) -> Optional[str]:
+    if not html_text:
+        return None
+    # 1) HTML lang attribute
+    m = HTML_LANG_RE.search(html_text)
+    if m:
+        return m.group(1).lower()
+    # 2) Title / Meta description text
+    candidates = []
+    t = TITLE_RE.search(html_text)
+    if t:
+        candidates.append(t.group(1))
+    d = META_DESC_RE.search(html_text)
+    if d:
+        candidates.append(d.group(1))
+    sample = " ".join(candidates)[:1000]
+    # Simple unicode range heuristics
+    if re.search(r"[\u0400-\u04FF]", sample):
+        return "ru"
+    if re.search(r"[\u0600-\u06FF]", sample):
+        return "ar"
+    if re.search(r"[\u0590-\u05FF]", sample):
+        return "he"
+    if re.search(r"[\u4E00-\u9FFF]", sample):
+        return "zh"
+    if re.search(r"[\u3040-\u30FF]", sample):
+        return "ja"
+    if re.search(r"[\uAC00-\uD7AF]", sample):
+        return "ko"
+    # Turkish characters
+    if re.search(r"[ğüşöçıİĞÜŞÖÇ]", sample):
+        return "tr"
+    # Default
+    return "en"
+
+def extract_title(html_text: str) -> Optional[str]:
+    if not html_text:
+        return None
+    m = TITLE_RE.search(html_text)
+    if m:
+        # collapse whitespace
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return None
+
+def extract_meta_description(html_text: str) -> Optional[str]:
+    if not html_text:
+        return None
+    m = META_DESC_RE.search(html_text)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return None
 
 # Worker per domain
 async def process_domain(domain, session, sem):
@@ -168,6 +254,9 @@ async def process_domain(domain, session, sem):
             "domain": domain,
             "site_status": "unknown",
             "site_url": "",
+            "language": "",
+            "title": "",
+            "description": "",
             # "txt_records": [],  # DNS временно отключено
             "registration_date": None,
             "emails": [],
@@ -208,6 +297,11 @@ async def process_domain(domain, session, sem):
                 result["tiktok"] = parsed["tiktok"]
                 result["vk"] = parsed["vk"]
                 result["trustpilot"] = parsed["trustpilot"]
+                # language detection
+                result["language"] = detect_language(site["content"]) or ""
+                # title & description
+                result["title"] = extract_title(site["content"]) or ""
+                result["description"] = extract_meta_description(site["content"]) or ""
 
             # registration date via WHOIS/RDAP (blocking call inside executor)
             # reg = await get_registration_date(domain)
@@ -229,7 +323,7 @@ async def main():
         results = await tqdm_asyncio.gather(*tasks)
 
     # Save CSV and JSON
-    keys = ["domain","site_status","site_url","registration_date","emails","phones","telegrams","whatsapps","facebook","instagram","youtube","x","reddit","tiktok","vk","trustpilot","error"]
+    keys = ["domain","site_status","site_url","language","title","description","registration_date","emails","phones","telegrams","whatsapps","facebook","instagram","youtube","x","reddit","tiktok","vk","trustpilot","error"]
     # CSV
     async with aiofiles.open(OUTPUT_CSV, "w", encoding="utf-8", newline='') as f:
         await f.write(",".join(keys) + "\n")
