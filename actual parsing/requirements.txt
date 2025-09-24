@@ -1,6 +1,6 @@
-aiohttp==3.8.5
-aiodns==3.5.0
-dnspython==2.3.0
-python-whois==0.7.3
-aiofiles==23.1.0
-tqdm==4.66.1
+aiohttp
+aiodns
+dnspython
+python-whois
+aiofiles
+tqdm
