@@ -1,0 +1,51 @@
+*.txt
+
+# --- Виртуальные окружения ---
+venv/
+.env/
+env/
+ENV/
+.venv/
+
+# --- Кэш и байткод ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Конфиги и IDE ---
+*.swp
+*.swo
+*.bak
+*.tmp
+*.log
+
+# PyInstaller
+*.spec
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# pytest
+.cache/
+.pytest_cache/
+
+# coverage
+.coverage
+htmlcov/
+
+# tox
+.tox/
+*.egg-info/
+.eggs/
+
+# build
+build/
+dist/
+*.egg
+pip-wheel-metadata/
