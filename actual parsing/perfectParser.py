@@ -39,6 +39,10 @@ WHATSAPP_URL_RE = re.compile(
 )
 MAILTO_RE = re.compile(r'href=["\']mailto:([^"\'>\s]+)', re.I)
 TEL_LINK_RE = re.compile(r'href=["\']tel:([^"\']+)', re.I)
+# Chat widgets/providers presence
+GETBUTTON_RE = re.compile(r'getbutton\.io', re.I)
+TAWK_RE = re.compile(r'tawk\.to', re.I)
+JIVOSITE_RE = re.compile(r'jivosite', re.I)
 FACEBOOK_RE = re.compile(r'(?:https?://)?(?:www\.)?(?:facebook\.com|fb\.com)/[A-Za-z0-9_.\-/?=&#]+', re.I)
 INSTAGRAM_RE = re.compile(r'(?:https?://)?(?:www\.)?instagram\.com/[A-Za-z0-9_.-]+', re.I)
 YOUTUBE_RE = re.compile(r'(?:https?://)?(?:www\.)?(?:youtube\.com|youtu\.be)/[\w@\-/?=&#.]+', re.I)
@@ -129,6 +133,9 @@ def parse_contacts(html_text: str):
              "facebook": [], "instagram": [], "youtube": [], "x": [], "reddit": [], "tiktok": [], "vk": [], "trustpilot": []}
     if not html_text:
         return found
+    # temporary collectors for phone priority
+    wa_phones = []
+    tel_phones = []
     # mailto links
     for m in MAILTO_RE.findall(html_text):
         email_value = m.strip()
@@ -139,21 +146,18 @@ def parse_contacts(html_text: str):
         email_value = m.strip()
         if email_value.lower() not in EMAIL_BLACKLIST:
             found["emails"].append(email_value)
-    # tel links
+    # tel links (only from anchor href)
     for t in TEL_LINK_RE.findall(html_text):
-        found["phones"].append(t.strip())
-    # phones in text
-    for p in PHONE_RE.findall(html_text):
-        # filter short matches and non-numeric-only garbage
-        cleaned = re.sub(r'[^\d+]', '', p)
-        if len(re.sub(r'\D', '', cleaned)) >= 6:
-            found["phones"].append(cleaned)
+        raw = t.strip()
+        digits_only = re.sub(r'\D', '', raw)
+        if len(digits_only) >= 6:
+            tel_phones.append("+" + digits_only)
     # telegram
     for tg in TELEGRAM_RE.findall(html_text):
         username = tg.strip().lstrip('@')
         if username:
             found["telegrams"].append(f"https://t.me/{username}")
-    # whatsapp: normalize links and extract phone numbers
+    # whatsapp: normalize links and extract phone numbers (priority)
     for m in WHATSAPP_URL_RE.finditer(html_text):
         num = m.group('num_api') or m.group('num_wa')
         chat = m.group('chat')
@@ -161,9 +165,9 @@ def parse_contacts(html_text: str):
             digits_only = re.sub(r'\D', '', num)
             link = f"https://wa.me/{digits_only}"
             found["whatsapps"].append(link)
-            # also add phone number
+            # also collect phone number with priority
             if digits_only:
-                found["phones"].append("+" + digits_only)
+                wa_phones.append("+" + digits_only)
         elif chat:
             link = f"https://chat.whatsapp.com/{chat}"
             found["whatsapps"].append(link)
@@ -191,12 +195,22 @@ def parse_contacts(html_text: str):
     # trustpilot
     for tp in TRUSTPILOT_RE.findall(html_text):
         found["trustpilot"].append(tp if isinstance(tp, str) else tp[0])
+    # apply phone priority: use whatsapp numbers if present, else tel numbers
+    found["phones"] = wa_phones if wa_phones else tel_phones
     # unique
     for k in found:
         found[k] = list(dict.fromkeys([x for x in found[k] if x]))
     # final email blacklist filter
     found["emails"] = [e for e in found["emails"] if e.lower() not in EMAIL_BLACKLIST]
     return found
+
+def detect_chat_widgets(html_text: str):
+    if not html_text:
+        return {"getbutton": "нет", "tawk": "нет", "jivosite": "нет"}
+    has_getbutton = "да" if GETBUTTON_RE.search(html_text) else "нет"
+    has_tawk = "да" if TAWK_RE.search(html_text) else "нет"
+    has_jivosite = "да" if JIVOSITE_RE.search(html_text) else "нет"
+    return {"getbutton": has_getbutton, "tawk": has_tawk, "jivosite": has_jivosite}
 
 def detect_language(html_text: str) -> Optional[str]:
     if not html_text:
@@ -274,6 +288,9 @@ async def process_domain(domain, session, sem):
             "tiktok": [],
             "vk": [],
             "trustpilot": [],
+            "getbutton": "нет",
+            "tawk": "нет",
+            "jivosite": "нет",
             "error": None
         }
         try:
@@ -300,6 +317,11 @@ async def process_domain(domain, session, sem):
                 result["tiktok"] = parsed["tiktok"]
                 result["vk"] = parsed["vk"]
                 result["trustpilot"] = parsed["trustpilot"]
+                # chat widgets
+                widgets = detect_chat_widgets(site["content"])
+                result["getbutton"] = widgets["getbutton"]
+                result["tawk"] = widgets["tawk"]
+                result["jivosite"] = widgets["jivosite"]
                 # language detection
                 result["language"] = detect_language(site["content"]) or ""
                 # title & description
@@ -326,7 +348,7 @@ async def main():
         results = await tqdm_asyncio.gather(*tasks)
 
     # Save CSV and JSON
-    keys = ["domain","site_status","site_url","language","title","description","registration_date","emails","phones","telegrams","whatsapps","facebook","instagram","youtube","x","reddit","tiktok","vk","trustpilot","error"]
+    keys = ["domain","site_status","site_url","language","title","description","registration_date","emails","phones","telegrams","whatsapps","facebook","instagram","youtube","x","reddit","tiktok","vk","trustpilot","getbutton","tawk","jivosite","error"]
     # CSV
     async with aiofiles.open(OUTPUT_CSV, "w", encoding="utf-8", newline='') as f:
         await f.write(",".join(keys) + "\n")
