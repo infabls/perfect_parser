@@ -11,13 +11,28 @@ from dns.asyncresolver import Resolver
 from pathlib import Path
 from typing import Optional
 from tqdm.asyncio import tqdm_asyncio
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # CONFIG
-CONCURRENCY = 30
+CONCURRENCY = 50
 REQUEST_TIMEOUT = 15
 RETRIES = 2
 OUTPUT_CSV = "domains_result.csv"
+OUTPUT_JSON = "domains_result.json"
 DOMAINS_FILE = "domains.txt"
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/10J67cLWeKQSGrqJL0tdsQ_OFBHLlR2N9DgR3mnyLHng/"
+GOOGLE_CREDENTIALS_FILE = "credentials.json"
+
+# MODE SETTINGS
+APPEND_MODE = True  # True = добавлять новые результаты к существующим, False = перезаписывать все
+SKIP_EXISTING_DOMAINS = True  # True = пропускать домены, которые уже есть в результатах, False = обрабатывать все домены из domains.txt
+
+# ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ:
+# 1. APPEND_MODE = True, SKIP_EXISTING_DOMAINS = True - добавляет только новые домены к существующим результатам
+# 2. APPEND_MODE = False, SKIP_EXISTING_DOMAINS = True - обрабатывает только новые домены, но перезаписывает файлы полностью
+# 3. APPEND_MODE = True, SKIP_EXISTING_DOMAINS = False - обрабатывает все домены из domains.txt и добавляет к существующим
+# 4. APPEND_MODE = False, SKIP_EXISTING_DOMAINS = False - полная перезапись всех результатов
 
 # Exclude known non-user emails
 EMAIL_BLACKLIST = {
@@ -51,6 +66,15 @@ REDDIT_RE = re.compile(r'(?:https?://)?(?:www\.)?reddit\.com/[A-Za-z0-9_\-/?=&#.
 TIKTOK_RE = re.compile(r'(?:https?://)?(?:www\.)?tiktok\.com/@[A-Za-z0-9_.-]+', re.I)
 VK_RE = re.compile(r'(?:https?://)?(?:www\.)?vk\.com/[A-Za-z0-9_.-]+', re.I)
 TRUSTPILOT_RE = re.compile(r'(?:https?://)?(?:www\.)?trustpilot\.com/(?:review|evaluate|view)/[A-Za-z0-9_.\-/]+', re.I)
+# Analytics detectors
+# Google: GA4 gtag id param (G-XXXX...), legacy UA-XXXX-Y, GTM-XXXXXX
+GA_GTAG_RE = re.compile(r'googletagmanager\.com/gtag/js\?id=([A-Z]+-[A-Z0-9]+)', re.I)
+GA_UA_RE = re.compile(r"['\"](UA-\d{4,}-\d+)['\"]", re.I)
+GTM_RE = re.compile(r'GTM-[A-Z0-9]+', re.I)
+# Yandex.Metrika: noscript watch/<id>, ym(<id>, 'init'), older yaCounter<id>
+YM_WATCH_RE = re.compile(r'mc\.yandex\.ru/watch/(\d+)', re.I)
+YM_FUNC_RE = re.compile(r'ym\(\s*(\d{6,})\s*,\s*["\']init["\']', re.I)
+YM_COUNTER_RE = re.compile(r'yaCounter(\d{6,})', re.I)
 
 # Language extraction helpers
 HTML_LANG_RE = re.compile(r'<html[^>]*\blang=["\']([a-zA-Z]{2,3})(?:-[a-zA-Z0-9-]+)?["\']', re.I)
@@ -66,6 +90,43 @@ def load_domains(path: str):
     if not p.exists():
         raise SystemExit(f"{path} not found")
     return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+# Helper: load existing results
+def load_existing_results():
+    """Load existing results from CSV and JSON files"""
+    existing_domains = set()
+    existing_results = []
+    
+    # Try to load from CSV first
+    csv_path = Path(OUTPUT_CSV)
+    if csv_path.exists():
+        try:
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    domain = row.get('domain', '').strip('"')
+                    if domain:
+                        existing_domains.add(domain)
+                        existing_results.append(row)
+        except Exception as e:
+            print(f"Warning: Could not load existing CSV results: {e}")
+    
+    # Try to load from JSON as backup
+    json_path = Path(OUTPUT_JSON)
+    if json_path.exists() and not existing_results:
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        domain = item.get('domain', '')
+                        if domain:
+                            existing_domains.add(domain)
+                            existing_results.append(item)
+        except Exception as e:
+            print(f"Warning: Could not load existing JSON results: {e}")
+    
+    return existing_domains, existing_results
 
 # HTTP fetch with aiohttp
 async def fetch_url(session: aiohttp.ClientSession, url: str, timeout=REQUEST_TIMEOUT) -> Optional[str]:
@@ -204,6 +265,30 @@ def parse_contacts(html_text: str):
     found["emails"] = [e for e in found["emails"] if e.lower() not in EMAIL_BLACKLIST]
     return found
 
+def detect_analytics(html_text: str):
+    if not html_text:
+        return {"ga_ids": [], "ym_ids": []}
+    ga_ids = []
+    ym_ids = []
+    # Google Analytics / Tag
+    for m in GA_GTAG_RE.findall(html_text):
+        ga_ids.append(m.strip())
+    for m in GA_UA_RE.findall(html_text):
+        ga_ids.append(m.strip())
+    for m in GTM_RE.findall(html_text):
+        ga_ids.append(m.strip())
+    # Yandex.Metrika
+    for m in YM_WATCH_RE.findall(html_text):
+        ym_ids.append(m.strip())
+    for m in YM_FUNC_RE.findall(html_text):
+        ym_ids.append(m.strip())
+    for m in YM_COUNTER_RE.findall(html_text):
+        ym_ids.append(m.strip())
+    # unique
+    ga_ids = list(dict.fromkeys([x for x in ga_ids if x]))
+    ym_ids = list(dict.fromkeys([x for x in ym_ids if x]))
+    return {"ga_ids": ga_ids, "ym_ids": ym_ids}
+
 def detect_chat_widgets(html_text: str):
     if not html_text:
         return {"getbutton": "нет", "tawk": "нет", "jivosite": "нет"}
@@ -288,6 +373,8 @@ async def process_domain(domain, session, sem):
             "tiktok": [],
             "vk": [],
             "trustpilot": [],
+            "ga_ids": [],
+            "ym_ids": [],
             "getbutton": "нет",
             "tawk": "нет",
             "jivosite": "нет",
@@ -317,6 +404,10 @@ async def process_domain(domain, session, sem):
                 result["tiktok"] = parsed["tiktok"]
                 result["vk"] = parsed["vk"]
                 result["trustpilot"] = parsed["trustpilot"]
+                # analytics
+                analytics = detect_analytics(site["content"])
+                result["ga_ids"] = analytics["ga_ids"]
+                result["ym_ids"] = analytics["ym_ids"]
                 # chat widgets
                 widgets = detect_chat_widgets(site["content"])
                 result["getbutton"] = widgets["getbutton"]
@@ -338,28 +429,145 @@ async def process_domain(domain, session, sem):
 
 # Main runner
 async def main():
-    domains = load_domains(DOMAINS_FILE)
+    # Load domains to process
+    all_domains = load_domains(DOMAINS_FILE)
+    
+    # Load existing results if in append mode
+    existing_domains = set()
+    existing_results = []
+    if APPEND_MODE or SKIP_EXISTING_DOMAINS:
+        existing_domains, existing_results = load_existing_results()
+        print(f"Found {len(existing_domains)} existing domains in results")
+    
+    # Filter domains based on settings
+    if SKIP_EXISTING_DOMAINS:
+        domains_to_process = [d for d in all_domains if d not in existing_domains]
+        print(f"Processing {len(domains_to_process)} new domains (skipping {len(all_domains) - len(domains_to_process)} existing)")
+    else:
+        domains_to_process = all_domains
+        print(f"Processing {len(domains_to_process)} domains")
+    
+    if not domains_to_process:
+        print("No new domains to process!")
+        return
+    
+    # Process domains
     sem = asyncio.Semaphore(CONCURRENCY)
     connector = aiohttp.TCPConnector(limit_per_host=10, ttl_dns_cache=300)
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers={"User-Agent":"Mozilla/5.0 (compatible; domain-scanner/1.0)"}) as session:
-        tasks = [process_domain(d, session, sem) for d in domains]
+        tasks = [process_domain(d, session, sem) for d in domains_to_process]
         # use tqdm_asyncio for progress
-        results = await tqdm_asyncio.gather(*tasks)
+        new_results = await tqdm_asyncio.gather(*tasks)
+
+    # Combine results
+    if APPEND_MODE:
+        all_results = existing_results + new_results
+        print(f"Total results: {len(all_results)} ({len(existing_results)} existing + {len(new_results)} new)")
+    else:
+        all_results = new_results
+        print(f"Total results: {len(all_results)}")
 
     # Save CSV and JSON
-    keys = ["domain","site_status","site_url","language","title","description","registration_date","emails","phones","telegrams","whatsapps","facebook","instagram","youtube","x","reddit","tiktok","vk","trustpilot","getbutton","tawk","jivosite","error"]
-    # CSV
+    keys = ["domain","site_status","site_url","language","title","description","registration_date","emails","phones","telegrams","whatsapps","facebook","instagram","youtube","x","reddit","tiktok","vk","trustpilot","ga_ids","ym_ids","getbutton","tawk","jivosite","error"]
+    
+    # CSV - always overwrite with complete data
     async with aiofiles.open(OUTPUT_CSV, "w", encoding="utf-8", newline='') as f:
         await f.write(",".join(keys) + "\n")
-        for row in results:
+        for row in all_results:
             # flatten lists as JSON strings
             csv_row = [row.get(k) if not isinstance(row.get(k), (list,dict)) else json.dumps(row.get(k), ensure_ascii=False) for k in keys]
             line = ",".join('"' + (str(x).replace('"','""') if x is not None else '') + '"' for x in csv_row) + "\n"
             await f.write(line)
-    # also write JSON
-    async with aiofiles.open("domains_result.json", "w", encoding="utf-8") as f:
-        await f.write(json.dumps(results, ensure_ascii=False, indent=2))
+    
+    # JSON - always overwrite with complete data
+    async with aiofiles.open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+        await f.write(json.dumps(all_results, ensure_ascii=False, indent=2))
+
+    # Export to Google Sheets
+    try:
+        await export_to_google_sheets(all_results, keys, append_mode=APPEND_MODE)
+    except Exception as e:
+        # don't fail the whole run on export error
+        print(f"Google Sheets export failed: {e}")
+
+def to_sheet_rows(results, keys):
+    header = keys
+    rows = [header]
+    for row in results:
+        values = []
+        for k in keys:
+            v = row.get(k)
+            if isinstance(v, (list, dict)):
+                values.append(json.dumps(v, ensure_ascii=False))
+            else:
+                values.append(v if v is not None else "")
+        rows.append(values)
+    return rows
+
+async def export_to_google_sheets(results, keys, append_mode=False):
+    # Use service account credentials
+    scope = [
+        'https://spreadsheets.google.com/feeds',
+        'https://www.googleapis.com/auth/drive',
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(GOOGLE_SHEET_URL)
+
+    # Prepare data in memory first
+    rows = to_sheet_rows(results, keys)
+
+    # Get the first worksheet
+    ws = sh.sheet1
+    
+    if append_mode:
+        # In append mode, only add new rows (skip header)
+        new_rows = rows[1:] if len(rows) > 1 else []
+        if new_rows:
+            # Get existing data to find where to append
+            try:
+                existing_records = ws.get_all_records()
+                existing_domains = {record.get('domain', '') for record in existing_records}
+                
+                # Filter out rows that already exist
+                truly_new_rows = []
+                for row in new_rows:
+                    domain = row[0] if row else ''  # domain is first column
+                    if domain not in existing_domains:
+                        truly_new_rows.append(row)
+                
+                if truly_new_rows:
+                    # Append new rows
+                    ws.append_rows(truly_new_rows)
+                    print(f"Added {len(truly_new_rows)} new rows to Google Sheets")
+                else:
+                    print("No new rows to add to Google Sheets")
+            except Exception as e:
+                print(f"Error in append mode, falling back to overwrite: {e}")
+                append_mode = False
+    
+    if not append_mode:
+        # Overwrite mode: clear all worksheets, keep first worksheet and overwrite
+        # Delete extra worksheets to keep the file clean
+        for w in sh.worksheets():
+            if w.id != ws.id:
+                try:
+                    sh.del_worksheet(w)
+                except Exception:
+                    pass
+        # Clear existing data
+        ws.clear()
+        # Batch update values in one call
+        # Determine range size
+        num_rows = len(rows)
+        num_cols = len(rows[0]) if rows else 0
+        if num_rows == 0 or num_cols == 0:
+            return
+        end_col_letter = chr(ord('A') + num_cols - 1) if num_cols <= 26 else 'Z'
+        cell_range = f"A1:{end_col_letter}{num_rows}"
+        ws.update(cell_range, rows)
+        print(f"Updated Google Sheets with {num_rows} rows")
 
 if __name__ == "__main__":
     asyncio.run(main())
